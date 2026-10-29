@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Camera Share</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, Arial, sans-serif; }
+    body { max-width: 900px; margin: 0 auto; padding: 20px; }
+    h1 { margin-bottom: 4px; }
+    .muted { opacity: .78; }
+    .panel { border: 1px solid #8886; border-radius: 14px; padding: 16px; margin: 14px 0; }
+    label { display:block; margin: 10px 0 5px; }
+    input, select, button { font: inherit; padding: 10px; border-radius: 8px; }
+    input { width: min(100%, 420px); box-sizing: border-box; }
+    button { cursor:pointer; margin: 6px 6px 6px 0; }
+    video { width: 100%; max-height: 65vh; background: #111; border-radius: 12px; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(260px,1fr)); gap:14px; }
+    #status { white-space: pre-wrap; }
+    .warning { border-left: 4px solid #d99b18; padding-left: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Live Camera Share</h1>
+  <p class="muted">A small consent-based demo for sharing a phone camera with a remote viewer.</p>
+
+  <div class="panel warning">
+    <strong>Privacy:</strong> The phone owner must choose “Camera sharer”, allow camera access,
+    and press “Start sharing”. A visible preview stays on the phone. Press “Stop sharing” to end it.
+    Do not share the room code publicly.
+  </div>
+
+  <div class="panel">
+    <label for="role">This device is</label>
+    <select id="role">
+      <option value="streamer">Camera sharer (phone owner)</option>
+      <option value="viewer">Viewer (your computer)</option>
+    </select>
+
+    <label for="room">Private room code (same code on both devices)</label>
+    <input id="room" autocomplete="off" placeholder="e.g. K7mP2vQ9xL4n" minlength="8" maxlength="64">
+
+    <div>
+      <button id="connect">Connect</button>
+      <button id="start" disabled>Start sharing</button>
+      <button id="flip" disabled>Switch front/back</button>
+      <button id="stop" disabled>Stop / disconnect</button>
+    </div>
+    <p id="status" role="status">Not connected.</p>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h3>Phone preview (sharer)</h3>
+      <video id="localVideo" autoplay playsinline muted></video>
+    </div>
+    <div class="panel">
+      <h3>Remote live video (viewer)</h3>
+      <video id="remoteVideo" autoplay playsinline controls></video>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const roleEl = document.getElementById('role');
+    const roomEl = document.getElementById('room');
+    const connectBtn = document.getElementById('connect');
+    const startBtn = document.getElementById('start');
+    const flipBtn = document.getElementById('flip');
+    const stopBtn = document.getElementById('stop');
+    const statusEl = document.getElementById('status');
+    const localVideo = document.getElementById('localVideo');
+    const remoteVideo = document.getElementById('remoteVideo');
+
+    let socket = null;
+    let pc = null;
+    let localStream = null;
+    let facingMode = 'environment';
+    let connected = false;
+
+    const iceServers = [
+      { urls: 'stun:stun.l.google.com:19302' }
+      // For reliable cross-network connectivity, configure a TURN server
+      // and add its URL plus credentials here. Never publish TURN secrets.
+    ];
+
+    function status(message) { statusEl.textContent = message; }
+
+    function newPeer() {
+      if (pc) pc.close();
+      pc = new RTCPeerConnection({ iceServers });
+      pc.onicecandidate = (event) => {
+        if (event.candidate && socket) socket.emit('ice-candidate', event.candidate);
+      };
+      pc.ontrack = (event) => {
+        remoteVideo.srcObject = event.streams[0];
+        status('Connected: receiving live camera video.');
+      };
+      pc.onconnectionstatechange = () => {
+        if (pc) status('Connection: ' + pc.connectionState);
+      };
+      if (localStream) {
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      }
+      return pc;
+    }
+
+    connectBtn.onclick = () => {
+      const room = roomEl.value.trim();
+      if (!/^[A-Za-z0-9_-]{8,64}$/.test(room)) {
+        status('Please enter a private room code of 8–64 letters/numbers/_/-.');
+        return;
+      }
+      if (socket) socket.disconnect();
+      socket = io();
+      socket.on('connect', () => {
+        socket.emit('join-room', { room, role: roleEl.value });
+      });
+      socket.on('joined', ({role}) => {
+        connected = true;
+        status('Connected to signaling server as ' + role + '. ' +
+          (role === 'streamer' ? 'Press Start sharing when ready.' : 'Waiting for the phone owner to start sharing.'));
+        startBtn.disabled = role !== 'streamer';
+        flipBtn.disabled = role !== 'streamer' || !localStream;
+        stopBtn.disabled = false;
+        connectBtn.disabled = true;
+        roleEl.disabled = true;
+        roomEl.disabled = true;
+      });
+      socket.on('app-error', msg => status('Error: ' + msg));
+      socket.on('peer-ready', ({role}) => {
+        status('Other participant connected (' + role + ').');
+      });
+      socket.on('offer', async (offer) => {
+        if (roleEl.value !== 'streamer' || !localStream) return;
+        try {
+          newPeer();
+          await pc.setRemoteDescription(offer);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          socket.emit('answer', pc.localDescription);
+          status('Sharing securely connected to viewer.');
+        } catch (e) { status('Could not answer call: ' + e.message); }
+      });
+      socket.on('answer', async (answer) => {
+        if (!pc) return;
+        try { await pc.setRemoteDescription(answer); }
+        catch (e) { status('Could not connect: ' + e.message); }
+      });
+      socket.on('ice-candidate', async (candidate) => {
+        if (!pc || !candidate) return;
+        try { await pc.addIceCandidate(candidate); } catch (_) {}
+      });
+      socket.on('stop-sharing', () => {
+        remoteVideo.srcObject = null;
+        status('The phone owner stopped sharing.');
+        if (pc) { pc.close(); pc = null; }
+      });
+      socket.on('peer-disconnected', () => status('The other participant disconnected.'));
+      socket.on('disconnect', () => status('Disconnected from server.'));
+    };
+
+    startBtn.onclick = async () => {
+      if (!connected || roleEl.value !== 'streamer') return;
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+        localVideo.srcObject = localStream;
+        flipBtn.disabled = false;
+        startBtn.disabled = true;
+        status('Camera is active. Your video is being shared with the connected viewer.');
+        // If the viewer joined first, start the offer from the viewer side via peer-ready.
+        socket.emit('peer-ready', { role: 'streamer' });
+      } catch (e) {
+        status('Camera permission or device error: ' + e.message);
+      }
+    };
+
+    // Viewer initiates WebRTC offer when the phone announces that it is ready.
+    if (typeof socket !== 'undefined') {
+      // Socket event handler is registered after connection in connect handler below.
+    }
+
+    // Add a listener for streamer readiness on the signaling socket.
+    const originalConnect = connectBtn.onclick;
+    connectBtn.onclick = () => {
+      originalConnect();
+      setTimeout(() => {
+        if (!socket) return;
+        socket.on('peer-ready', async ({role}) => {
+          if (roleEl.value !== 'viewer') return;
+          try {
+            newPeer();
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socket.emit('offer', pc.localDescription);
+            status('Calling phone camera…');
+          } catch (e) { status('Could not start viewer connection: ' + e.message); }
+        });
+      }, 0);
+    };
+
+    flipBtn.onclick = async () => {
+      if (!localStream) return;
+      localStream.getTracks().forEach(track => track.stop());
+      localStream = null;
+      facingMode = facingMode === 'environment' ? 'user' : 'environment';
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+        localVideo.srcObject = localStream;
+        if (pc) {
+          const newTrack = localStream.getVideoTracks()[0];
+          const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+          if (sender) await sender.replaceTrack(newTrack);
+        }
+        status('Switched camera.');
+      } catch (e) { status('Could not switch camera: ' + e.message); }
+    };
+
+    stopBtn.onclick = () => {
+      if (socket) socket.emit('stop-sharing');
+      if (pc) { pc.close(); pc = null; }
+      if (localStream) localStream.getTracks().forEach(track => track.stop());
+      localStream = null;
+      localVideo.srcObject = null;
+      remoteVideo.srcObject = null;
+      if (socket) { socket.disconnect(); socket = null; }
+      connected = false;
+      connectBtn.disabled = false;
+      roleEl.disabled = false;
+      roomEl.disabled = false;
+      startBtn.disabled = true;
+      flipBtn.disabled = true;
+      stopBtn.disabled = true;
+      status('Stopped. Camera tracks and connection closed.');
+    };
+
+    window.addEventListener('beforeunload', () => {
+      if (localStream) localStream.getTracks().forEach(track => track.stop());
+      if (socket) socket.disconnect();
+    });
+  </script>
+</body>
+</html>
